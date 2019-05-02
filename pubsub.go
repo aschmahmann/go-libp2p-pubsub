@@ -13,6 +13,7 @@ import (
 
 	logging "github.com/ipfs/go-log"
 	crypto "github.com/libp2p/go-libp2p-crypto"
+	discovery "github.com/libp2p/go-libp2p-discovery"
 	host "github.com/libp2p/go-libp2p-host"
 	inet "github.com/libp2p/go-libp2p-net"
 	peer "github.com/libp2p/go-libp2p-peer"
@@ -97,6 +98,10 @@ type PubSub struct {
 
 	seenMessagesMx sync.Mutex
 	seenMessages   *timecache.TimeCache
+
+	// bootstrapping and discovery
+	discovery discovery.Discovery
+	discoveryOpts []discovery.Option
 
 	// key for signing messages; nil when signing is disabled (default for now)
 	signKey crypto.PrivKey
@@ -257,6 +262,15 @@ func WithStrictSignatureVerification(required bool) Option {
 func WithBlacklist(b Blacklist) Option {
 	return func(p *PubSub) error {
 		p.blacklist = b
+		return nil
+	}
+}
+
+// WithDiscovery provides a discovery mechanism used to bootstrap and provide peers into PubSub
+func WithDiscovery(d discovery.Discovery, opts ...discovery.Option) Option {
+	return func(p *PubSub) error {
+		p.discovery = d
+		p.discoveryOpts = opts
 		return nil
 	}
 }
@@ -711,6 +725,19 @@ func (p *PubSub) Publish(topic string, data []byte) error {
 		}
 	}
 	p.publish <- &Message{m}
+	return nil
+}
+
+func (p *PubSub) bootstrap(topic string) <-chan pstore.PeerInfo{
+	if p.discovery != nil{
+		discoveryTopic := "floodsub:" + topic
+		peers, err := p.discovery.FindPeers(p.ctx, discoveryTopic, p.discoveryOpts...)
+		if err != nil {
+			log.Debugf("could not find any peers to bootstrap the topic: %s", topic)
+			return nil
+		}
+		return peers
+	}
 	return nil
 }
 
