@@ -3,6 +3,7 @@ package pubsub
 import (
 	"context"
 	"fmt"
+	discovery "github.com/libp2p/go-libp2p-discovery"
 	"math/rand"
 	"time"
 
@@ -38,13 +39,13 @@ var (
 // NewGossipSub returns a new PubSub object using GossipSubRouter as the router.
 func NewGossipSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, error) {
 	rt := &GossipSubRouter{
-		peers:   make(map[peer.ID]protocol.ID),
-		mesh:    make(map[string]map[peer.ID]struct{}),
-		fanout:  make(map[string]map[peer.ID]struct{}),
-		lastpub: make(map[string]int64),
-		gossip:  make(map[peer.ID][]*pb.ControlIHave),
-		control: make(map[peer.ID]*pb.ControlMessage),
-		mcache:  NewMessageCache(GossipSubHistoryGossip, GossipSubHistoryLength),
+		peers:       make(map[peer.ID]protocol.ID),
+		mesh:        make(map[string]map[peer.ID]struct{}),
+		fanout:      make(map[string]map[peer.ID]struct{}),
+		lastpub:     make(map[string]int64),
+		gossip:      make(map[peer.ID][]*pb.ControlIHave),
+		control:     make(map[peer.ID]*pb.ControlMessage),
+		mcache:      NewMessageCache(GossipSubHistoryGossip, GossipSubHistoryLength),
 	}
 	return NewPubSub(ctx, h, rt, opts...)
 }
@@ -57,14 +58,14 @@ func NewGossipSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, er
 // is the fanout map. Fanout peer lists are expired if we don't publish any
 // messages to their topic for GossipSubFanoutTTL.
 type GossipSubRouter struct {
-	p       *PubSub
-	peers   map[peer.ID]protocol.ID         // peer protocols
-	mesh    map[string]map[peer.ID]struct{} // topic meshes
-	fanout  map[string]map[peer.ID]struct{} // topic fanout
-	lastpub map[string]int64                // last publish time for fanout topics
-	gossip  map[peer.ID][]*pb.ControlIHave  // pending gossip
-	control map[peer.ID]*pb.ControlMessage  // pending control messages
-	mcache  *MessageCache
+	p           *PubSub
+	peers       map[peer.ID]protocol.ID         // peer protocols
+	mesh        map[string]map[peer.ID]struct{} // topic meshes
+	fanout      map[string]map[peer.ID]struct{} // topic fanout
+	lastpub     map[string]int64                // last publish time for fanout topics
+	gossip      map[peer.ID][]*pb.ControlIHave  // pending gossip
+	control     map[peer.ID]*pb.ControlMessage  // pending control messages
+	mcache      *MessageCache
 }
 
 func (gs *GossipSubRouter) Protocols() []protocol.ID {
@@ -293,12 +294,15 @@ func (gs *GossipSubRouter) Leave(topic string) {
 	log.Debugf("LEAVE %s", topic)
 
 	delete(gs.mesh, topic)
-
 	for p := range gmap {
 		log.Debugf("LEAVE: Remove mesh link to %s in %s", p, topic)
 		gs.sendPrune(p, topic)
 		gs.untagPeer(p, topic)
 	}
+}
+
+func (gs *GossipSubRouter) Bootstrap() []discovery.Option {
+	return []discovery.Option{}
 }
 
 func (gs *GossipSubRouter) sendGraft(p peer.ID, topic string) {
@@ -357,6 +361,7 @@ func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC) {
 func (gs *GossipSubRouter) heartbeatTimer() {
 	time.Sleep(GossipSubHeartbeatInitialDelay)
 	select {
+
 	case gs.p.eval <- gs.heartbeat:
 	case <-gs.p.ctx.Done():
 		return
@@ -408,6 +413,13 @@ func (gs *GossipSubRouter) heartbeat() {
 				topics := tograft[p]
 				tograft[p] = append(topics, topic)
 			}
+		}
+
+		// if we still don't have enough peers request discovering more
+		if len(peers) < GossipSubDlo {
+			go func(){
+				gs.p.rediscover <- &Rediscover{topic, []discovery.Option{discovery.Limit(GossipSubDhi)}}
+			}()
 		}
 
 		// do we have too many peers?
