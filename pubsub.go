@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	peerstore "github.com/libp2p/go-libp2p-peerstore"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -18,7 +19,7 @@ import (
 	inet "github.com/libp2p/go-libp2p-net"
 	peer "github.com/libp2p/go-libp2p-peer"
 	protocol "github.com/libp2p/go-libp2p-protocol"
-	timecache "github.com/whyrusleeping/timecache"
+	"github.com/whyrusleeping/timecache"
 )
 
 var (
@@ -99,9 +100,23 @@ type PubSub struct {
 	seenMessagesMx sync.Mutex
 	seenMessages   *timecache.TimeCache
 
-	// bootstrapping and discovery
+	// discovery assists in discovering and advertising peers for a topic
 	discovery discovery.Discovery
-	discoveryOpts []discovery.Option
+
+	// advertising tracks which topics are being advertised
+	advertising map[string]context.CancelFunc
+
+	// bootstrapped tracks which topics have been bootstrapped
+	bootstrapped sync.Map
+
+	// rediscover handles continuing peer rediscovery
+	rediscover chan *Rediscover
+
+	// ongoingDiscovery tracks ongoing rediscovery requests
+	ongoingDiscovery map[string]struct{}
+
+	// doneDiscovery handles completion of a rediscovery request
+	doneRediscovery chan string
 
 	// key for signing messages; nil when signing is disabled (default for now)
 	signKey crypto.PrivKey
@@ -135,6 +150,9 @@ type PubSubRouter interface {
 	// Leave notifies the router that we are no longer interested in a topic.
 	// It is invoked after the unsubscription announcement.
 	Leave(topic string)
+	// Bootstrap gets the bootstrapping discovery parameters from the router.
+	// It also sets the mechanism for retrieving new discovery requests for the topic.
+	Bootstrap() []discovery.Option
 }
 
 type Message struct {
@@ -185,6 +203,11 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		blacklistPeer: make(chan peer.ID),
 		seenMessages:  timecache.NewTimeCache(TimeCacheDuration),
 		counter:       uint64(time.Now().UnixNano()),
+		bootstrapped:     sync.Map{},
+		rediscover:       make(chan *Rediscover),
+		ongoingDiscovery: make(map[string]struct{}),
+		doneRediscovery:  make(chan string),
+		advertising:      make(map[string]context.CancelFunc),
 	}
 
 	for _, opt := range opts {
@@ -269,8 +292,7 @@ func WithBlacklist(b Blacklist) Option {
 // WithDiscovery provides a discovery mechanism used to bootstrap and provide peers into PubSub
 func WithDiscovery(d discovery.Discovery, opts ...discovery.Option) Option {
 	return func(p *PubSub) error {
-		p.discovery = d
-		p.discoveryOpts = opts
+		p.discovery = &pubSubDiscovery{Discovery: d, opts: opts}
 		return nil
 	}
 }
@@ -411,8 +433,64 @@ func (p *PubSub) processLoop(ctx context.Context) {
 				p.rt.RemovePeer(pid)
 			}
 
+		case discover := <-p.rediscover:
+			topic := discover.topic
+			if _, ok := p.ongoingDiscovery[topic]; !ok {
+				p.ongoingDiscovery[topic] = struct{}{}
+				go func() {
+					p.handleDiscovery(p.ctx, topic, discover.opts)
+					p.doneRediscovery <- topic
+				}()
+			}
+		case topic := <-p.doneRediscovery:
+			delete(p.ongoingDiscovery, topic)
+
 		case <-ctx.Done():
 			log.Info("pubsub processloop shutting down")
+			return
+		}
+	}
+}
+
+func (p *PubSub) handleDiscovery(ctx context.Context, topic string, opts []discovery.Option) {
+	if p.discovery == nil {
+		return
+	}
+
+	discoverCtx, cancel := context.WithTimeout(ctx, time.Second*10)
+	defer cancel()
+
+	peerChan, err := p.discovery.FindPeers(discoverCtx, topic, opts...)
+	if err != nil {
+		log.Debugf("error finding peers for topic %s: %v", topic, err)
+		return
+	}
+
+	for {
+		select {
+		case pi, more := <-peerChan:
+			go func() {
+				ctx, cancel := context.WithTimeout(ctx, time.Second*10)
+				defer cancel()
+
+				err := p.host.Connect(ctx, pi)
+				if err != nil {
+					log.Debugf("Error connecting to pubsub peer %s: %s", pi.ID, err.Error())
+					return
+				}
+
+				// delay to let pubsub perform its handshake
+				time.Sleep(time.Millisecond * 250)
+
+				log.Debugf("Connected to pubsub peer %s", pi.ID)
+			}()
+
+			if !more {
+				return
+			}
+
+		case <-discoverCtx.Done():
+			log.Infof("pubsub discovery for %s complete", topic)
 			return
 		}
 	}
@@ -435,6 +513,8 @@ func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 
 	if len(subs) == 0 {
 		delete(p.myTopics, sub.topic)
+		p.advertising[sub.topic]()
+		delete(p.advertising, sub.topic)
 		p.announce(sub.topic, false)
 		p.rt.Leave(sub.topic)
 	}
@@ -450,6 +530,7 @@ func (p *PubSub) handleAddSubscription(req *addSubReq) {
 
 	// announce we want this topic
 	if len(subs) == 0 {
+		p.advertise(sub.topic)
 		p.announce(sub.topic, true)
 		p.rt.Join(sub.topic)
 	}
@@ -689,6 +770,8 @@ func (p *PubSub) SubscribeByTopicDescriptor(td *pb.TopicDescriptor, opts ...SubO
 	}
 
 	out := make(chan *Subscription, 1)
+
+	p.bootstrap(sub.topic)
 	p.addSub <- &addSubReq{
 		sub:  sub,
 		resp: out,
@@ -724,21 +807,71 @@ func (p *PubSub) Publish(topic string, data []byte) error {
 			return err
 		}
 	}
+
+	p.bootstrap(topic)
 	p.publish <- &Message{m}
+
 	return nil
 }
 
-func (p *PubSub) bootstrap(topic string) <-chan pstore.PeerInfo{
-	if p.discovery != nil{
-		discoveryTopic := "floodsub:" + topic
-		peers, err := p.discovery.FindPeers(p.ctx, discoveryTopic, p.discoveryOpts...)
-		if err != nil {
-			log.Debugf("could not find any peers to bootstrap the topic: %s", topic)
-			return nil
-		}
-		return peers
+
+// bootstrap handles initial bootstrapping of peers for a given topic
+func (p *PubSub) bootstrap(topic string) {
+	_, bootstrapped := p.bootstrapped.LoadOrStore(topic, struct{}{})
+	if !bootstrapped {
+		dOpts := p.rt.Bootstrap()
+		p.handleDiscovery(p.ctx, topic, dOpts)
 	}
-	return nil
+}
+
+// advertise advertises this node's interest in a topic to a discovery service
+func (p *PubSub) advertise(topic string) {
+	if p.discovery != nil {
+		advertisingCtx, cancel := context.WithCancel(p.ctx)
+
+		if _, ok := p.advertising[topic]; ok {
+			return
+		}
+		p.advertising[topic] = cancel
+
+		go func() {
+			next, err := p.discovery.Advertise(advertisingCtx, topic)
+			if err != nil {
+				log.Warningf("bootstrap: error providing rendezvous for %s: %s", topic, err.Error())
+			}
+
+			for {
+				select {
+				case <-time.After(next):
+					next, err = p.discovery.Advertise(advertisingCtx, topic)
+					if err != nil {
+						log.Warningf("bootstrap: error providing rendezvous for %s: %s", topic, err.Error())
+					}
+				case <-advertisingCtx.Done():
+					return
+				}
+			}
+		}()
+	}
+}
+
+type Rediscover struct {
+	topic string
+	opts  []discovery.Option
+}
+
+type pubSubDiscovery struct {
+	discovery.Discovery
+	opts []discovery.Option
+}
+
+// Advertise advertises a service
+func (d *pubSubDiscovery) Advertise(ctx context.Context, ns string, opts ...discovery.Option) (time.Duration, error) {
+	return d.Discovery.Advertise(ctx, "floodsub"+ns, append(opts, d.opts...)...)
+}
+
+func (d *pubSubDiscovery) FindPeers(ctx context.Context, ns string, opts ...discovery.Option) (<-chan peerstore.PeerInfo, error) {
+	return d.Discovery.FindPeers(ctx, "floodsub"+ns, append(opts, d.opts...)...)
 }
 
 func (p *PubSub) nextSeqno() []byte {
