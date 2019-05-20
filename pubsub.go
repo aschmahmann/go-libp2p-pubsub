@@ -513,8 +513,10 @@ func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 
 	if len(subs) == 0 {
 		delete(p.myTopics, sub.topic)
-		p.advertising[sub.topic]()
-		delete(p.advertising, sub.topic)
+		if advertiseCancel, ok := p.advertising[sub.topic]; ok{
+			advertiseCancel()
+			delete(p.advertising, sub.topic)
+		}
 		p.announce(sub.topic, false)
 		p.rt.Leave(sub.topic)
 	}

@@ -417,8 +417,9 @@ func (gs *GossipSubRouter) heartbeat() {
 
 		// if we still don't have enough peers request discovering more
 		if len(peers) < GossipSubDlo {
+			rediscoverTopic := topic
 			go func() {
-				gs.p.rediscover <- &Rediscover{topic, []discovery.Option{discovery.Limit(GossipSubDhi)}}
+				gs.p.rediscover <- &Rediscover{rediscoverTopic, []discovery.Option{discovery.Limit(GossipSubDhi)}}
 			}()
 		}
 
