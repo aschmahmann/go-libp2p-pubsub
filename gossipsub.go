@@ -9,9 +9,9 @@ import (
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 
-	host "github.com/libp2p/go-libp2p-host"
-	peer "github.com/libp2p/go-libp2p-peer"
-	protocol "github.com/libp2p/go-libp2p-protocol"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/protocol"
 )
 
 const (
@@ -232,7 +232,7 @@ func (gs *GossipSubRouter) Publish(from peer.ID, msg *pb.Message) {
 		if !ok {
 			// we are not in the mesh for topic, use fanout peers
 			gmap, ok = gs.fanout[topic]
-			if !ok {
+			if !ok || len(gmap) == 0 {
 				// we don't have any, pick some
 				peers := gs.getPeers(topic, GossipSubD, func(peer.ID) bool { return true })
 
