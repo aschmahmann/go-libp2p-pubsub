@@ -2,8 +2,6 @@ package pubsub
 
 import (
 	"context"
-	discovery "github.com/libp2p/go-libp2p-discovery"
-
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 
 	"github.com/libp2p/go-libp2p-core/host"
@@ -107,7 +105,3 @@ func (rs *RandomSubRouter) Publish(from peer.ID, msg *pb.Message) {
 func (rs *RandomSubRouter) Join(topic string) {}
 
 func (rs *RandomSubRouter) Leave(topic string) {}
-
-func (rs *RandomSubRouter) Bootstrap() []discovery.Option {
-	return []discovery.Option{}
-}

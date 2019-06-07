@@ -2,7 +2,6 @@ package pubsub
 
 import (
 	"context"
-	discovery "github.com/libp2p/go-libp2p-discovery"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 
 	"github.com/libp2p/go-libp2p-core/host"
@@ -82,7 +81,3 @@ func (fs *FloodSubRouter) Publish(from peer.ID, msg *pb.Message) {
 func (fs *FloodSubRouter) Join(topic string) {}
 
 func (fs *FloodSubRouter) Leave(topic string) {}
-
-func (fs *FloodSubRouter) Bootstrap() []discovery.Option {
-	return []discovery.Option{}
-}

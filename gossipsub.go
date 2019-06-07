@@ -3,12 +3,12 @@ package pubsub
 import (
 	"context"
 	"fmt"
-	discovery "github.com/libp2p/go-libp2p-discovery"
 	"math/rand"
 	"time"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 
+	"github.com/libp2p/go-libp2p-core/discovery"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/protocol"
@@ -34,6 +34,9 @@ var (
 
 	// fanout ttl
 	GossipSubFanoutTTL = 60 * time.Second
+
+	// discovery parameters
+	GossipSubNPeers = 100
 )
 
 // NewGossipSub returns a new PubSub object using GossipSubRouter as the router.
@@ -301,10 +304,6 @@ func (gs *GossipSubRouter) Leave(topic string) {
 	}
 }
 
-func (gs *GossipSubRouter) Bootstrap() []discovery.Option {
-	return []discovery.Option{}
-}
-
 func (gs *GossipSubRouter) sendGraft(p peer.ID, topic string) {
 	graft := []*pb.ControlGraft{&pb.ControlGraft{TopicID: &topic}}
 	out := rpcWithControl(nil, nil, nil, graft, nil)
@@ -419,7 +418,7 @@ func (gs *GossipSubRouter) heartbeat() {
 		if len(peers) < GossipSubDlo {
 			rediscoverTopic := topic
 			go func() {
-				gs.p.rediscover <- &Rediscover{rediscoverTopic, []discovery.Option{discovery.Limit(GossipSubDhi)}}
+				gs.p.disc.discover <- &Discover{rediscoverTopic, []discovery.Option{discovery.Limit(GossipSubNPeers)}}
 			}()
 		}
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	peerstore "github.com/libp2p/go-libp2p-peerstore"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -20,7 +19,7 @@ import (
 	"github.com/libp2p/go-libp2p-core/protocol"
 
 	logging "github.com/ipfs/go-log"
-	"github.com/whyrusleeping/timecache"
+	timecache "github.com/whyrusleeping/timecache"
 )
 
 var (
@@ -43,6 +42,8 @@ type PubSub struct {
 	rt PubSubRouter
 
 	val *validation
+
+	disc *discover
 
 	// incoming messages from other peers
 	incoming chan *RPC
@@ -74,6 +75,18 @@ type PubSub struct {
 	// a notification channel for when our peers die
 	peerDead chan peer.ID
 
+	// tracks the channels subscribed to new peer notifications
+	newPeerNotif map[chan peer.ID]struct{}
+
+	// setup new peer notifier
+	addPeerNotif chan *reqNewPeerNotifier
+
+	// remove peer notifier
+	rmPeerNotif chan chan peer.ID
+
+	// peers that we have connected to, but have not received a Hello from
+	inflightPeers map[peer.ID]struct{}
+
 	// The set of topics we are subscribed to
 	myTopics map[string]map[*Subscription]struct{}
 
@@ -100,24 +113,6 @@ type PubSub struct {
 
 	seenMessagesMx sync.Mutex
 	seenMessages   *timecache.TimeCache
-
-	// discovery assists in discovering and advertising peers for a topic
-	discovery discovery.Discovery
-
-	// advertising tracks which topics are being advertised
-	advertising map[string]context.CancelFunc
-
-	// bootstrapped tracks which topics have been bootstrapped
-	bootstrapped sync.Map
-
-	// rediscover handles continuing peer rediscovery
-	rediscover chan *Rediscover
-
-	// ongoingDiscovery tracks ongoing rediscovery requests
-	ongoingDiscovery map[string]struct{}
-
-	// doneDiscovery handles completion of a rediscovery request
-	doneRediscovery chan string
 
 	// key for signing messages; nil when signing is disabled (default for now)
 	signKey crypto.PrivKey
@@ -151,9 +146,6 @@ type PubSubRouter interface {
 	// Leave notifies the router that we are no longer interested in a topic.
 	// It is invoked after the unsubscription announcement.
 	Leave(topic string)
-	// Bootstrap gets the bootstrapping discovery parameters from the router.
-	// It also sets the mechanism for retrieving new discovery requests for the topic.
-	Bootstrap() []discovery.Option
 }
 
 type Message struct {
@@ -176,39 +168,39 @@ type Option func(*PubSub) error
 // NewPubSub returns a new PubSub management object.
 func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option) (*PubSub, error) {
 	ps := &PubSub{
-		host:             h,
-		ctx:              ctx,
-		rt:               rt,
-		val:              newValidation(),
-		signID:           h.ID(),
-		signKey:          h.Peerstore().PrivKey(h.ID()),
-		signStrict:       true,
-		incoming:         make(chan *RPC, 32),
-		publish:          make(chan *Message),
-		newPeers:         make(chan peer.ID),
-		newPeerStream:    make(chan network.Stream),
-		newPeerError:     make(chan peer.ID),
-		peerDead:         make(chan peer.ID),
-		cancelCh:         make(chan *Subscription),
-		getPeers:         make(chan *listPeerReq),
-		addSub:           make(chan *addSubReq),
-		getTopics:        make(chan *topicReq),
-		sendMsg:          make(chan *sendReq, 32),
-		addVal:           make(chan *addValReq),
-		rmVal:            make(chan *rmValReq),
-		eval:             make(chan func()),
-		myTopics:         make(map[string]map[*Subscription]struct{}),
-		topics:           make(map[string]map[peer.ID]struct{}),
-		peers:            make(map[peer.ID]chan *RPC),
-		blacklist:        NewMapBlacklist(),
-		blacklistPeer:    make(chan peer.ID),
-		seenMessages:     timecache.NewTimeCache(TimeCacheDuration),
-		counter:          uint64(time.Now().UnixNano()),
-		bootstrapped:     sync.Map{},
-		rediscover:       make(chan *Rediscover),
-		ongoingDiscovery: make(map[string]struct{}),
-		doneRediscovery:  make(chan string),
-		advertising:      make(map[string]context.CancelFunc),
+		host:          h,
+		ctx:           ctx,
+		rt:            rt,
+		val:           newValidation(),
+		disc:          newDiscover(),
+		signID:        h.ID(),
+		signKey:       h.Peerstore().PrivKey(h.ID()),
+		signStrict:    true,
+		incoming:      make(chan *RPC, 32),
+		publish:       make(chan *Message),
+		newPeers:      make(chan peer.ID),
+		newPeerStream: make(chan network.Stream),
+		newPeerError:  make(chan peer.ID),
+		peerDead:      make(chan peer.ID),
+		newPeerNotif:  make(map[chan peer.ID]struct{}),
+		addPeerNotif:  make(chan *reqNewPeerNotifier),
+		rmPeerNotif:   make(chan chan peer.ID),
+		inflightPeers: make(map[peer.ID]struct{}),
+		cancelCh:      make(chan *Subscription),
+		getPeers:      make(chan *listPeerReq),
+		addSub:        make(chan *addSubReq),
+		getTopics:     make(chan *topicReq),
+		sendMsg:       make(chan *sendReq, 32),
+		addVal:        make(chan *addValReq),
+		rmVal:         make(chan *rmValReq),
+		eval:          make(chan func()),
+		myTopics:      make(map[string]map[*Subscription]struct{}),
+		topics:        make(map[string]map[peer.ID]struct{}),
+		peers:         make(map[peer.ID]chan *RPC),
+		blacklist:     NewMapBlacklist(),
+		blacklistPeer: make(chan peer.ID),
+		seenMessages:  timecache.NewTimeCache(TimeCacheDuration),
+		counter:       uint64(time.Now().UnixNano()),
 	}
 
 	for _, opt := range opts {
@@ -230,6 +222,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 	h.Network().Notify((*PubSubNotif)(ps))
 
 	ps.val.Start(ps)
+	ps.disc.Start(ps)
 
 	go ps.processLoop(ctx)
 
@@ -293,7 +286,7 @@ func WithBlacklist(b Blacklist) Option {
 // WithDiscovery provides a discovery mechanism used to bootstrap and provide peers into PubSub
 func WithDiscovery(d discovery.Discovery, opts ...discovery.Option) Option {
 	return func(p *PubSub) error {
-		p.discovery = &pubSubDiscovery{Discovery: d, opts: opts}
+		p.disc.discovery = &pubSubDiscovery{Discovery: d, opts: opts}
 		return nil
 	}
 }
@@ -319,6 +312,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 
 			if p.blacklist.Contains(pid) {
 				log.Warning("ignoring connection from blacklisted peer: ", pid)
+				p.notifyNewPeer(pid)
 				continue
 			}
 
@@ -326,6 +320,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			messages <- p.getHelloPacket()
 			go p.handleNewPeer(ctx, pid, messages)
 			p.peers[pid] = messages
+			p.inflightPeers[pid] = struct{}{}
 
 		case s := <-p.newPeerStream:
 			pid := s.Conn().RemotePeer()
@@ -341,6 +336,8 @@ func (p *PubSub) processLoop(ctx context.Context) {
 				log.Warning("closing stream for blacklisted peer: ", pid)
 				close(ch)
 				s.Reset()
+				delete(p.inflightPeers, pid)
+				p.notifyNewPeer(pid)
 				continue
 			}
 
@@ -348,6 +345,8 @@ func (p *PubSub) processLoop(ctx context.Context) {
 
 		case pid := <-p.newPeerError:
 			delete(p.peers, pid)
+			delete(p.inflightPeers, pid)
+			p.notifyNewPeer(pid)
 
 		case pid := <-p.peerDead:
 			ch, ok := p.peers[pid]
@@ -365,15 +364,35 @@ func (p *PubSub) processLoop(ctx context.Context) {
 				messages <- p.getHelloPacket()
 				go p.handleNewPeer(ctx, pid, messages)
 				p.peers[pid] = messages
+				p.inflightPeers[pid] = struct{}{}
 				continue
 			}
 
 			delete(p.peers, pid)
+			delete(p.inflightPeers, pid)
 			for _, t := range p.topics {
 				delete(t, pid)
 			}
 
 			p.rt.RemovePeer(pid)
+			p.notifyNewPeer(pid)
+
+		case add := <-p.addPeerNotif:
+			intersect := p.peerSetIntersect(add.initPeers)
+			chSize := len(intersect)
+			const minSize = 10
+			if chSize < minSize {
+				chSize = minSize
+			}
+			ch := make(chan peer.ID, chSize)
+			for _, pid := range intersect {
+				ch <- pid
+			}
+			p.newPeerNotif[ch] = struct{}{}
+			add.resp <- ch
+
+		case rm := <-p.rmPeerNotif:
+			delete(p.newPeerNotif, rm)
 
 		case treq := <-p.getTopics:
 			var out []string
@@ -428,23 +447,12 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			if ok {
 				close(ch)
 				delete(p.peers, pid)
+				delete(p.inflightPeers, pid)
 				for _, t := range p.topics {
 					delete(t, pid)
 				}
 				p.rt.RemovePeer(pid)
 			}
-
-		case discover := <-p.rediscover:
-			topic := discover.topic
-			if _, ok := p.ongoingDiscovery[topic]; !ok {
-				p.ongoingDiscovery[topic] = struct{}{}
-				go func() {
-					p.handleDiscovery(p.ctx, topic, discover.opts)
-					p.doneRediscovery <- topic
-				}()
-			}
-		case topic := <-p.doneRediscovery:
-			delete(p.ongoingDiscovery, topic)
 
 		case <-ctx.Done():
 			log.Info("pubsub processloop shutting down")
@@ -453,48 +461,46 @@ func (p *PubSub) processLoop(ctx context.Context) {
 	}
 }
 
-func (p *PubSub) handleDiscovery(ctx context.Context, topic string, opts []discovery.Option) {
-	if p.discovery == nil {
-		return
-	}
+type reqNewPeerNotifier struct {
+	initPeers map[peer.ID]struct{}
+	resp      chan chan peer.ID
+}
 
-	discoverCtx, cancel := context.WithTimeout(ctx, time.Second*10)
-	defer cancel()
-
-	peerChan, err := p.discovery.FindPeers(discoverCtx, topic, opts...)
-	if err != nil {
-		log.Debugf("error finding peers for topic %s: %v", topic, err)
-		return
-	}
-
-	for {
+func (p *PubSub) notifyNewPeer(pid peer.ID) {
+	for ch := range p.newPeerNotif {
 		select {
-		case pi, more := <-peerChan:
-			go func() {
-				ctx, cancel := context.WithTimeout(ctx, time.Second*10)
-				defer cancel()
-
-				err := p.host.Connect(ctx, pi)
-				if err != nil {
-					log.Debugf("Error connecting to pubsub peer %s: %s", pi.ID, err.Error())
-					return
-				}
-
-				// delay to let pubsub perform its handshake
-				time.Sleep(time.Millisecond * 250)
-
-				log.Debugf("Connected to pubsub peer %s", pi.ID)
-			}()
-
-			if !more {
-				return
-			}
-
-		case <-discoverCtx.Done():
-			log.Infof("pubsub discovery for %s complete", topic)
-			return
+		case ch <- pid:
+		default:
+			log.Error("dropped msg")
 		}
 	}
+}
+
+func (p *PubSub) peerSetIntersect(peerset map[peer.ID]struct{}) []peer.ID {
+	totalPeers := len(p.peers)
+	numMaxPeers := len(peerset)
+	peersetBigger := false
+	if numMaxPeers > totalPeers {
+		numMaxPeers = totalPeers
+		peersetBigger = true
+	}
+
+	peerBuffer := make([]peer.ID, 0, totalPeers)
+	if peersetBigger {
+		for pid := range p.peers {
+			if _, ok := peerset[pid]; ok {
+				peerBuffer = append(peerBuffer, pid)
+			}
+		}
+	} else {
+		for pid := range peerset {
+			if _, ok := p.peers[pid]; ok {
+				peerBuffer = append(peerBuffer, pid)
+			}
+		}
+	}
+
+	return peerBuffer
 }
 
 // handleRemoveSubscription removes Subscription sub from bookeeping.
@@ -514,10 +520,7 @@ func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 
 	if len(subs) == 0 {
 		delete(p.myTopics, sub.topic)
-		if advertiseCancel, ok := p.advertising[sub.topic]; ok {
-			advertiseCancel()
-			delete(p.advertising, sub.topic)
-		}
+		p.disc.stopAdvertise(sub.topic)
 		p.announce(sub.topic, false)
 		p.rt.Leave(sub.topic)
 	}
@@ -533,7 +536,7 @@ func (p *PubSub) handleAddSubscription(req *addSubReq) {
 
 	// announce we want this topic
 	if len(subs) == 0 {
-		p.advertise(sub.topic)
+		p.disc.advertise(sub.topic)
 		p.announce(sub.topic, true)
 		p.rt.Join(sub.topic)
 	}
@@ -687,6 +690,11 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		p.pushMsg(rpc.from, msg)
 	}
 
+	if _, ok := p.inflightPeers[rpc.from]; ok {
+		delete(p.inflightPeers, rpc.from)
+		p.notifyNewPeer(rpc.from)
+	}
+
 	p.rt.HandleRPC(rpc)
 }
 
@@ -774,7 +782,8 @@ func (p *PubSub) SubscribeByTopicDescriptor(td *pb.TopicDescriptor, opts ...SubO
 
 	out := make(chan *Subscription, 1)
 
-	p.bootstrap(sub.topic)
+	go p.disc.bootstrap(true, sub.topic)
+
 	p.addSub <- &addSubReq{
 		sub:  sub,
 		resp: out,
@@ -811,69 +820,10 @@ func (p *PubSub) Publish(topic string, data []byte) error {
 		}
 	}
 
-	p.bootstrap(topic)
+	p.disc.bootstrap(false, topic)
 	p.publish <- &Message{m}
 
 	return nil
-}
-
-// bootstrap handles initial bootstrapping of peers for a given topic
-func (p *PubSub) bootstrap(topic string) {
-	_, bootstrapped := p.bootstrapped.LoadOrStore(topic, struct{}{})
-	if !bootstrapped {
-		dOpts := p.rt.Bootstrap()
-		p.handleDiscovery(p.ctx, topic, dOpts)
-	}
-}
-
-// advertise advertises this node's interest in a topic to a discovery service
-func (p *PubSub) advertise(topic string) {
-	if p.discovery != nil {
-		advertisingCtx, cancel := context.WithCancel(p.ctx)
-
-		if _, ok := p.advertising[topic]; ok {
-			return
-		}
-		p.advertising[topic] = cancel
-
-		go func() {
-			next, err := p.discovery.Advertise(advertisingCtx, topic)
-			if err != nil {
-				log.Warningf("bootstrap: error providing rendezvous for %s: %s", topic, err.Error())
-			}
-
-			for {
-				select {
-				case <-time.After(next):
-					next, err = p.discovery.Advertise(advertisingCtx, topic)
-					if err != nil {
-						log.Warningf("bootstrap: error providing rendezvous for %s: %s", topic, err.Error())
-					}
-				case <-advertisingCtx.Done():
-					return
-				}
-			}
-		}()
-	}
-}
-
-type Rediscover struct {
-	topic string
-	opts  []discovery.Option
-}
-
-type pubSubDiscovery struct {
-	discovery.Discovery
-	opts []discovery.Option
-}
-
-// Advertise advertises a service
-func (d *pubSubDiscovery) Advertise(ctx context.Context, ns string, opts ...discovery.Option) (time.Duration, error) {
-	return d.Discovery.Advertise(ctx, "floodsub"+ns, append(opts, d.opts...)...)
-}
-
-func (d *pubSubDiscovery) FindPeers(ctx context.Context, ns string, opts ...discovery.Option) (<-chan peerstore.PeerInfo, error) {
-	return d.Discovery.FindPeers(ctx, "floodsub"+ns, append(opts, d.opts...)...)
 }
 
 func (p *PubSub) nextSeqno() []byte {
