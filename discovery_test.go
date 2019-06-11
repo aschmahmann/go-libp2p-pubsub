@@ -228,10 +228,10 @@ func TestGossipSubDiscoveryAfterBootstrap(t *testing.T) {
 	}
 
 	// Wait for network to finish forming then join the partitions via discovery
-	time.Sleep(time.Second * 1)
+	time.Sleep(time.Second * 2)
 
 	for _, ps := range psubs {
-		pn := len(ps.peers)
+		pn := len(ps.ListPeers("foobar"))
 		if pn != partitionSize-1 {
 			t.Fatal("partitions not properly formed")
 		}
@@ -246,7 +246,7 @@ func TestGossipSubDiscoveryAfterBootstrap(t *testing.T) {
 
 	// verify the network is fully connected
 	for _, ps := range psubs {
-		pn := len(ps.peers)
+		pn := len(ps.ListPeers("foobar"))
 		if pn != numHosts-1 {
 			t.Fatal("network not fully connected")
 		}
