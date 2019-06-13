@@ -75,18 +75,6 @@ type PubSub struct {
 	// a notification channel for when our peers die
 	peerDead chan peer.ID
 
-	// tracks the channels subscribed to new peer notifications
-	newPeerNotif map[chan peer.ID]struct{}
-
-	// setup new peer notifier
-	addPeerNotif chan *reqNewPeerNotifier
-
-	// remove peer notifier
-	rmPeerNotif chan chan peer.ID
-
-	// peers that we have connected to, but have not received a Hello from
-	inflightPeers map[peer.ID]struct{}
-
 	// The set of topics we are subscribed to
 	myTopics map[string]map[*Subscription]struct{}
 
@@ -182,10 +170,6 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		newPeerStream: make(chan network.Stream),
 		newPeerError:  make(chan peer.ID),
 		peerDead:      make(chan peer.ID),
-		newPeerNotif:  make(map[chan peer.ID]struct{}),
-		addPeerNotif:  make(chan *reqNewPeerNotifier),
-		rmPeerNotif:   make(chan chan peer.ID),
-		inflightPeers: make(map[peer.ID]struct{}),
 		cancelCh:      make(chan *Subscription),
 		getPeers:      make(chan *listPeerReq),
 		addSub:        make(chan *addSubReq),
@@ -312,7 +296,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 
 			if p.blacklist.Contains(pid) {
 				log.Warning("ignoring connection from blacklisted peer: ", pid)
-				p.notifyNewPeer(pid)
+				p.disc.NotifyNewPeer(pid)
 				continue
 			}
 
@@ -320,7 +304,6 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			messages <- p.getHelloPacket()
 			go p.handleNewPeer(ctx, pid, messages)
 			p.peers[pid] = messages
-			p.inflightPeers[pid] = struct{}{}
 
 		case s := <-p.newPeerStream:
 			pid := s.Conn().RemotePeer()
@@ -336,8 +319,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 				log.Warning("closing stream for blacklisted peer: ", pid)
 				close(ch)
 				s.Reset()
-				delete(p.inflightPeers, pid)
-				p.notifyNewPeer(pid)
+				p.disc.NotifyNewPeer(pid)
 				continue
 			}
 
@@ -345,8 +327,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 
 		case pid := <-p.newPeerError:
 			delete(p.peers, pid)
-			delete(p.inflightPeers, pid)
-			p.notifyNewPeer(pid)
+			p.disc.NotifyNewPeer(pid)
 
 		case pid := <-p.peerDead:
 			ch, ok := p.peers[pid]
@@ -364,35 +345,15 @@ func (p *PubSub) processLoop(ctx context.Context) {
 				messages <- p.getHelloPacket()
 				go p.handleNewPeer(ctx, pid, messages)
 				p.peers[pid] = messages
-				p.inflightPeers[pid] = struct{}{}
 				continue
 			}
 
 			delete(p.peers, pid)
-			delete(p.inflightPeers, pid)
 			for _, t := range p.topics {
 				delete(t, pid)
 			}
 
 			p.rt.RemovePeer(pid)
-			p.notifyNewPeer(pid)
-
-		case add := <-p.addPeerNotif:
-			intersect := p.peerSetIntersect(add.initPeers)
-			chSize := len(intersect)
-			const minSize = 10
-			if chSize < minSize {
-				chSize = minSize
-			}
-			ch := make(chan peer.ID, chSize)
-			for _, pid := range intersect {
-				ch <- pid
-			}
-			p.newPeerNotif[ch] = struct{}{}
-			add.resp <- ch
-
-		case rm := <-p.rmPeerNotif:
-			delete(p.newPeerNotif, rm)
 
 		case treq := <-p.getTopics:
 			var out []string
@@ -447,7 +408,6 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			if ok {
 				close(ch)
 				delete(p.peers, pid)
-				delete(p.inflightPeers, pid)
 				for _, t := range p.topics {
 					delete(t, pid)
 				}
@@ -459,48 +419,6 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			return
 		}
 	}
-}
-
-type reqNewPeerNotifier struct {
-	initPeers map[peer.ID]struct{}
-	resp      chan chan peer.ID
-}
-
-func (p *PubSub) notifyNewPeer(pid peer.ID) {
-	for ch := range p.newPeerNotif {
-		select {
-		case ch <- pid:
-		default:
-			log.Error("dropped msg")
-		}
-	}
-}
-
-func (p *PubSub) peerSetIntersect(peerset map[peer.ID]struct{}) []peer.ID {
-	totalPeers := len(p.peers)
-	numMaxPeers := len(peerset)
-	peersetBigger := false
-	if numMaxPeers > totalPeers {
-		numMaxPeers = totalPeers
-		peersetBigger = true
-	}
-
-	peerBuffer := make([]peer.ID, 0, totalPeers)
-	if peersetBigger {
-		for pid := range p.peers {
-			if _, ok := peerset[pid]; ok {
-				peerBuffer = append(peerBuffer, pid)
-			}
-		}
-	} else {
-		for pid := range peerset {
-			if _, ok := p.peers[pid]; ok {
-				peerBuffer = append(peerBuffer, pid)
-			}
-		}
-	}
-
-	return peerBuffer
 }
 
 // handleRemoveSubscription removes Subscription sub from bookeeping.
@@ -520,7 +438,7 @@ func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 
 	if len(subs) == 0 {
 		delete(p.myTopics, sub.topic)
-		p.disc.stopAdvertise(sub.topic)
+		p.disc.StopAdvertise(sub.topic)
 		p.announce(sub.topic, false)
 		p.rt.Leave(sub.topic)
 	}
@@ -536,7 +454,7 @@ func (p *PubSub) handleAddSubscription(req *addSubReq) {
 
 	// announce we want this topic
 	if len(subs) == 0 {
-		p.disc.advertise(sub.topic)
+		p.disc.Advertise(sub.topic)
 		p.announce(sub.topic, true)
 		p.rt.Join(sub.topic)
 	}
@@ -690,10 +608,7 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		p.pushMsg(rpc.from, msg)
 	}
 
-	if _, ok := p.inflightPeers[rpc.from]; ok {
-		delete(p.inflightPeers, rpc.from)
-		p.notifyNewPeer(rpc.from)
-	}
+	p.disc.NotifyNewPeer(rpc.from)
 
 	p.rt.HandleRPC(rpc)
 }
@@ -782,7 +697,7 @@ func (p *PubSub) SubscribeByTopicDescriptor(td *pb.TopicDescriptor, opts ...SubO
 
 	out := make(chan *Subscription, 1)
 
-	go p.disc.bootstrap(true, sub.topic)
+	go p.disc.Bootstrap(true, sub.topic)
 
 	p.addSub <- &addSubReq{
 		sub:  sub,
@@ -820,7 +735,7 @@ func (p *PubSub) Publish(topic string, data []byte) error {
 		}
 	}
 
-	p.disc.bootstrap(false, topic)
+	p.disc.Bootstrap(false, topic)
 	p.publish <- &Message{m}
 
 	return nil
