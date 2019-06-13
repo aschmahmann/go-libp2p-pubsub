@@ -418,7 +418,7 @@ func (gs *GossipSubRouter) heartbeat() {
 		if len(peers) < GossipSubDlo {
 			rediscoverTopic := topic
 			go func() {
-				gs.p.disc.discover <- &Discover{rediscoverTopic, []discovery.Option{discovery.Limit(GossipSubNPeers)}}
+				gs.p.disc.Discover(rediscoverTopic, discovery.Limit(GossipSubNPeers))
 			}()
 		}
 
