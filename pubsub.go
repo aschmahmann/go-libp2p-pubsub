@@ -374,8 +374,10 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			delete(p.peers, pid)
 			delete(p.inflightPeers, pid)
 			for t, tmap := range p.topics {
-				delete(tmap, pid)
-				p.notifySubscriberLeft(t, pid)
+				if _, ok := tmap[pid]; ok {
+					delete(tmap, pid)
+					p.notifyLeave(t, pid)
+				}
 			}
 
 			p.rt.RemovePeer(pid)
@@ -453,8 +455,10 @@ func (p *PubSub) processLoop(ctx context.Context) {
 				delete(p.peers, pid)
 				delete(p.inflightPeers, pid)
 				for t, tmap := range p.topics {
-					delete(tmap, pid)
-					p.notifySubscriberLeft(t, pid)
+					if _, ok := tmap[pid]; ok {
+						delete(tmap, pid)
+						p.notifyLeave(t, pid)
+					}
 				}
 				p.rt.RemovePeer(pid)
 			}
@@ -521,8 +525,8 @@ func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 
 	sub.err = fmt.Errorf("subscription cancelled by calling sub.Cancel()")
 	close(sub.ch)
-	close(sub.inboundSubs)
-	close(sub.leavingSubs)
+	close(sub.joinCh)
+	close(sub.leaveCh)
 	delete(subs, sub)
 
 	if len(subs) == 0 {
@@ -561,12 +565,12 @@ func (p *PubSub) handleAddSubscription(req *addSubReq) {
 	}
 
 	sub.ch = make(chan *Message, 32)
-	sub.inboundSubs = make(chan peer.ID, inboundBufSize)
-	sub.leavingSubs = make(chan peer.ID, 32)
+	sub.joinCh = make(chan peer.ID, inboundBufSize)
+	sub.leaveCh = make(chan peer.ID, 32)
 	sub.cancelCh = p.cancelCh
 
 	for pid := range tmap {
-		sub.inboundSubs <- pid
+		sub.joinCh <- pid
 	}
 
 	p.myTopics[sub.topic][sub] = struct{}{}
@@ -679,11 +683,11 @@ func (p *PubSub) subscribedToMsg(msg *pb.Message) bool {
 	return false
 }
 
-func (p *PubSub) notifySubscriberLeft(topic string, pid peer.ID) {
+func (p *PubSub) notifyLeave(topic string, pid peer.ID) {
 	if subs, ok := p.myTopics[topic]; ok {
 		for s := range subs {
 			select {
-			case s.leavingSubs <- pid:
+			case s.leaveCh <- pid:
 			default:
 				log.Infof("Can't deliver leave event to subscription for topic %s; subscriber too slow", topic)
 			}
@@ -707,7 +711,7 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 					inboundPeer := rpc.from
 					for s := range subs {
 						select {
-						case s.inboundSubs <- inboundPeer:
+						case s.joinCh <- inboundPeer:
 						default:
 							log.Infof("Can't deliver join event to subscription for topic %s; subscriber too slow", t)
 						}
@@ -719,8 +723,11 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 			if !ok {
 				continue
 			}
-			delete(tmap, rpc.from)
-			p.notifySubscriberLeft(t, rpc.from)
+
+			if _, ok := tmap[rpc.from]; ok {
+				delete(tmap, rpc.from)
+				p.notifyLeave(t, rpc.from)
+			}
 		}
 	}
 
