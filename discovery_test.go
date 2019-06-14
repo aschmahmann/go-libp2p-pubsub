@@ -228,13 +228,8 @@ func TestGossipSubDiscoveryAfterBootstrap(t *testing.T) {
 	}
 
 	// Wait for network to finish forming then join the partitions via discovery
-	time.Sleep(time.Second * 2)
-
 	for _, ps := range psubs {
-		pn := len(ps.ListPeers("foobar"))
-		if pn != partitionSize-1 {
-			t.Fatal("partitions not properly formed")
-		}
+		waitUntilGossipsubMeshCount(ps, "foobar", partitionSize-1)
 	}
 
 	for i := 0; i < partitionSize; i++ {
@@ -242,15 +237,12 @@ func TestGossipSubDiscoveryAfterBootstrap(t *testing.T) {
 	}
 
 	// wait for the partitions to join
-	time.Sleep(time.Second * 2)
-
 	// verify the network is fully connected
 	for _, ps := range psubs {
-		pn := len(ps.ListPeers("foobar"))
-		if pn != numHosts-1 {
-			t.Fatal("network not fully connected")
-		}
+		waitUntilGossipsubMeshCount(ps, "foobar", numHosts-1)
 	}
+
+	time.Sleep(100 * time.Millisecond)
 
 	// test the mesh
 	for i := 0; i < 100; i++ {
@@ -268,6 +260,21 @@ func TestGossipSubDiscoveryAfterBootstrap(t *testing.T) {
 			if !bytes.Equal(msg, got.Data) {
 				t.Fatal("got wrong message!")
 			}
+		}
+	}
+}
+
+func waitUntilGossipsubMeshCount(ps *PubSub, topic string, count int) {
+	done := false
+	doneCh := make(chan bool, 1)
+	rt := ps.rt.(*GossipSubRouter)
+	for !done {
+		ps.eval <- func() {
+			doneCh <- len(rt.mesh[topic]) == count
+		}
+		done = <-doneCh
+		if !done {
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }

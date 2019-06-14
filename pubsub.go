@@ -697,7 +697,7 @@ func (p *PubSub) SubscribeByTopicDescriptor(td *pb.TopicDescriptor, opts ...SubO
 
 	out := make(chan *Subscription, 1)
 
-	go p.disc.Bootstrap(true, sub.topic)
+	p.disc.Bootstrap(true, sub.topic)
 
 	p.addSub <- &addSubReq{
 		sub:  sub,
