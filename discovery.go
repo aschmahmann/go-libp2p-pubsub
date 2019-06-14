@@ -76,6 +76,16 @@ func (d *discover) discoverLoop() {
 		select {
 		case discover := <-d.discoverQ:
 			topic := discover.topic
+
+			d.bootstrappedMux.RLock()
+			bootstrapDone := d.bootstrapped[topic]
+			d.bootstrappedMux.RUnlock()
+			select {
+			case _ = <-bootstrapDone:
+			default:
+				continue
+			}
+
 			if _, ok := d.ongoing[topic]; !ok {
 				d.ongoing[topic] = struct{}{}
 				go func() {
@@ -181,19 +191,27 @@ func (d *discover) Bootstrap(async bool, topic string, dOpts ...discovery.Option
 		d.bootstrappedMux.Lock()
 		doneCh, bootstrapStarted := d.bootstrapped[topic]
 		if bootstrapStarted {
+			d.bootstrappedMux.Unlock()
 			if !async {
 				_ = <-doneCh
 			}
-			d.bootstrappedMux.Unlock()
 			return
 		}
 		ch := make(chan struct{}, 1)
 		d.bootstrapped[topic] = ch
 		d.bootstrappedMux.Unlock()
 
-		d.handleDiscovery(d.p.ctx, topic, dOpts)
-		ch <- struct{}{}
-		close(ch)
+		if async {
+			go func() {
+				d.handleDiscovery(d.p.ctx, topic, dOpts)
+				ch <- struct{}{}
+				close(ch)
+			}()
+		} else {
+			d.handleDiscovery(d.p.ctx, topic, dOpts)
+			ch <- struct{}{}
+			close(ch)
+		}
 	}
 }
 
