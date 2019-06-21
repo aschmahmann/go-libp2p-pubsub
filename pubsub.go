@@ -81,9 +81,6 @@ type PubSub struct {
 	// topics tracks which topics each of our peers are subscribed to
 	topics map[string]map[peer.ID]struct{}
 
-	// a set of notification channels for newly subscribed peers
-	newSubs map[string]chan peer.ID
-
 	// sendMsg handles messages that have been validated
 	sendMsg chan *sendReq
 
@@ -442,9 +439,7 @@ func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 	}
 
 	sub.err = fmt.Errorf("subscription cancelled by calling sub.Cancel()")
-	close(sub.ch)
-	close(sub.joinCh)
-	close(sub.leaveCh)
+	sub.close()
 	delete(subs, sub)
 
 	if len(subs) == 0 {
@@ -626,10 +621,10 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 			if _, ok = tmap[rpc.from]; !ok {
 				tmap[rpc.from] = struct{}{}
 				if subs, ok := p.myTopics[t]; ok {
-					inboundPeer := rpc.from
+					peer := rpc.from
 					for s := range subs {
 						select {
-						case s.joinCh <- inboundPeer:
+						case s.joinCh <- peer:
 						default:
 							log.Infof("Can't deliver join event to subscription for topic %s; subscriber too slow", t)
 						}
