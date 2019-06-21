@@ -2,10 +2,11 @@ package pubsub
 
 import (
 	"context"
-	"github.com/libp2p/go-libp2p-core/discovery"
-	"github.com/libp2p/go-libp2p-core/peer"
 	"sync"
 	"time"
+
+	"github.com/libp2p/go-libp2p-core/discovery"
+	"github.com/libp2p/go-libp2p-core/peer"
 )
 
 // discover represents the discovery pipeline.
@@ -46,7 +47,7 @@ type discover struct {
 	rmPeerNotif chan chan peer.ID
 }
 
-// newValidation creates a new validation pipeline
+// newDiscover creates a new peer discovery mechanism
 func newDiscover() *discover {
 	return &discover{
 		advertising:  make(map[string]context.CancelFunc),
@@ -81,7 +82,7 @@ func (d *discover) discoverLoop() {
 			bootstrapDone := d.bootstrapped[topic]
 			d.bootstrappedMux.RUnlock()
 			select {
-			case _ = <-bootstrapDone:
+			case <-bootstrapDone:
 			default:
 				continue
 			}
@@ -185,7 +186,7 @@ func (d *discover) Bootstrap(async bool, topic string, dOpts ...discovery.Option
 
 	if bootstrapStarted {
 		if !async {
-			_ = <-doneCh
+			<-doneCh
 		}
 	} else {
 		d.bootstrappedMux.Lock()
@@ -193,7 +194,7 @@ func (d *discover) Bootstrap(async bool, topic string, dOpts ...discovery.Option
 		if bootstrapStarted {
 			d.bootstrappedMux.Unlock()
 			if !async {
-				_ = <-doneCh
+				<-doneCh
 			}
 			return
 		}
@@ -228,7 +229,7 @@ func (d *discover) handleDiscovery(ctx context.Context, topic string, opts []dis
 	discoverCtx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
 
-	peerChan, err := d.discovery.FindPeers(discoverCtx, topic, opts...)
+	peerCh, err := d.discovery.FindPeers(discoverCtx, topic, opts...)
 	if err != nil {
 		log.Debugf("error finding peers for topic %s: %v", topic, err)
 		return
@@ -239,7 +240,7 @@ func (d *discover) handleDiscovery(ctx context.Context, topic string, opts []dis
 loop:
 	for {
 		select {
-		case pi, more := <-peerChan:
+		case pi, more := <-peerCh:
 			if pi.ID == d.p.host.ID() || pi.ID == "" {
 				if more {
 					continue
@@ -302,7 +303,7 @@ func (d *discover) NotifyNewPeer(pid peer.ID) {
 	select {
 	case d.peerNotifier <- pid:
 	default:
-		log.Error("dropped msg")
+		log.Error("pubsub-discovery: dropped peer discovery notification")
 	}
 }
 

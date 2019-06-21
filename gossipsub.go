@@ -297,6 +297,7 @@ func (gs *GossipSubRouter) Leave(topic string) {
 	log.Debugf("LEAVE %s", topic)
 
 	delete(gs.mesh, topic)
+
 	for p := range gmap {
 		log.Debugf("LEAVE: Remove mesh link to %s in %s", p, topic)
 		gs.sendPrune(p, topic)
@@ -360,7 +361,6 @@ func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC) {
 func (gs *GossipSubRouter) heartbeatTimer() {
 	time.Sleep(GossipSubHeartbeatInitialDelay)
 	select {
-
 	case gs.p.eval <- gs.heartbeat:
 	case <-gs.p.ctx.Done():
 		return
